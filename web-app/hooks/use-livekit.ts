@@ -7,7 +7,7 @@ import {
   LocalAudioTrack,
   createLocalAudioTrack,
 } from "livekit-client";
-import { LIVEKIT_CONFIG } from "@/lib/livekit-config";
+import { createVoiceSession, endVoiceSession } from "@/lib/api-client";
 
 interface UseLiveKitReturn {
   isConnected: boolean;
@@ -31,6 +31,8 @@ export function useLiveKit(): UseLiveKitReturn {
   const localAudioTrackRef = useRef<LocalAudioTrack | null>(null);
   const audioLevelIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const aiAudioCleanupRef = useRef<(() => void) | null>(null);
+  const roomNameRef = useRef<string | null>(null);
+  const agentConnectedRef = useRef<boolean>(false);
 
   const monitorAudioLevel = useCallback(
     (track: MediaStreamTrack, type: "user" | "ai"): (() => void) | null => {
@@ -79,17 +81,9 @@ export function useLiveKit(): UseLiveKitReturn {
     try {
       setError(null);
 
-      if (!LIVEKIT_CONFIG.url) {
-        throw new Error(
-          "LiveKit URL is not configured. Please set NEXT_PUBLIC_LIVEKIT_URL"
-        );
-      }
-
-      if (!LIVEKIT_CONFIG.token) {
-        throw new Error(
-          "LiveKit token is not configured. Please set NEXT_PUBLIC_LIVEKIT_TOKEN"
-        );
-      }
+      // Fetch session info from Go backend
+      const session = await createVoiceSession();
+      roomNameRef.current = session.room_name;
 
       const room = new Room();
       roomRef.current = room;
@@ -97,6 +91,7 @@ export function useLiveKit(): UseLiveKitReturn {
       // Set up event listeners
       room.on(RoomEvent.Connected, () => {
         setIsConnected(true);
+        console.log("Connected to LiveKit room:", session.room_name);
       });
 
       room.on(RoomEvent.Disconnected, () => {
@@ -104,6 +99,28 @@ export function useLiveKit(): UseLiveKitReturn {
         setIsRecording(false);
         setUserSpeaking(false);
         setAiSpeaking(false);
+        agentConnectedRef.current = false;
+        console.log("Disconnected from LiveKit room");
+      });
+
+      room.on(RoomEvent.ParticipantConnected, (participant) => {
+        console.log("Participant connected:", participant.identity);
+        // Check if this is the AI agent (usually has "agent" in identity or name)
+        if (
+          participant.identity.includes("agent") ||
+          participant.name?.toLowerCase().includes("agent")
+        ) {
+          agentConnectedRef.current = true;
+          console.log("AI agent connected to room");
+        }
+      });
+
+      room.on(RoomEvent.ParticipantDisconnected, (participant) => {
+        console.log("Participant disconnected:", participant.identity);
+        if (agentConnectedRef.current) {
+          agentConnectedRef.current = false;
+          console.log("AI agent disconnected from room");
+        }
       });
 
       room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
@@ -119,19 +136,23 @@ export function useLiveKit(): UseLiveKitReturn {
               mediaStreamTrack,
               "ai"
             );
+            console.log(
+              "Subscribed to AI audio track from:",
+              participant.identity
+            );
           }
         }
       });
 
-      // Connect to room
-      await room.connect(LIVEKIT_CONFIG.url, LIVEKIT_CONFIG.token);
+      // Connect using token from Go backend
+      await room.connect(session.url, session.token);
     } catch (err) {
       const errorMessage =
         err instanceof Error ? err.message : "Failed to connect to LiveKit";
       setError(errorMessage);
       console.error("LiveKit connection error:", err);
     }
-  }, []);
+  }, [monitorAudioLevel]);
 
   const disconnect = useCallback(async () => {
     try {
@@ -155,10 +176,21 @@ export function useLiveKit(): UseLiveKitReturn {
         roomRef.current = null;
       }
 
+      // Clean up session on backend (optional, but good practice)
+      if (roomNameRef.current) {
+        try {
+          await endVoiceSession(roomNameRef.current);
+        } catch (err) {
+          console.warn("Failed to end voice session on backend:", err);
+        }
+        roomNameRef.current = null;
+      }
+
       setIsConnected(false);
       setIsRecording(false);
       setUserSpeaking(false);
       setAiSpeaking(false);
+      agentConnectedRef.current = false;
     } catch (err) {
       console.error("LiveKit disconnect error:", err);
     }
